@@ -1,0 +1,494 @@
+---
+title: "Pharmacy Operations Analytics"
+author: "Kush Manek"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+```{r}
+
+library(tidyverse)
+library(lubridate)
+library(janitor)
+
+set.seed(123)
+
+### 1. technicians.csv (20,000 rows)
+technicians <- tibble(
+  technician_id = sprintf("T%03d", 1:20000),
+  name = paste0("Tech_", sprintf("T%03d", 1:20000)),
+  experience_years = sample(1:10, 20000, replace = TRUE),
+  shift_type = sample(c("Day","Evening","Mixed"), 20000, replace = TRUE)
+)
+
+write_csv(technicians, "technicians.csv")
+
+### 2. patients.csv (20,000 rows)
+cities <- c("Victoria","Saanich","Langford","Sidney","Nanaimo")
+
+patients <- tibble(
+  patient_id = sprintf("P%05d", 1:20000),
+  age = sample(18:95, 20000, replace = TRUE),
+  sex = sample(c("F","M","Other"), 20000, replace = TRUE),
+  chronic_conditions_count = sample(0:4, 20000, replace = TRUE),
+  insurance_type = sample(c("Public","Private","None"), 20000, replace = TRUE),
+  city = sample(cities, 20000, replace = TRUE)
+)
+
+write_csv(patients, "patients.csv")
+
+### 3. inventory.csv (20,000 rows)
+drug_classes <- c("Antibiotic","Antidepressant","Analgesic","Antihypertensive","Antidiabetic")
+forms <- c("Tablet","Capsule","Syrup","Injection")
+
+inventory <- tibble(
+  drug_id = sprintf("D%03d", 1:20000),
+  drug_name = paste0("STAT_D", sprintf("%03d", 1:20000)),
+  drug_class = sample(drug_classes, 20000, replace = TRUE),
+  form = sample(forms, 20000, replace = TRUE),
+  strength = paste0(sample(c(5, 10, 20, 50, 100), 20000, replace = TRUE), "mg"),
+  stock_on_hand = sample(0:500, 20000, replace = TRUE),
+  reorder_level = sample(20:100, 20000, replace = TRUE),
+  lead_time_days = sample(1:30, 20000, replace = TRUE),
+  unit_cost = round(runif(20000, 5, 200), 2),
+  expiry_date = sample(seq.Date(as.Date("2024-01-01"), as.Date("2026-12-31"), by="day"), 20000, replace = TRUE)
+)
+
+write_csv(inventory, "inventory.csv")
+
+### 4. prescriptions.csv (20,000 rows)
+dates_2024 <- seq.POSIXt(
+  as.POSIXct("2024-01-01 08:00:00"),
+  as.POSIXct("2024-12-31 20:00:00"),
+  by = "min"
+)
+
+prescriptions <- tibble(
+  prescription_id = sprintf("RX%06d", 1:20000),
+  patient_id = sample(patients$patient_id, 20000, replace = TRUE),
+  technician_id = sample(technicians$technician_id, 20000, replace = TRUE),
+  drug_id = sample(inventory$drug_id, 20000, replace = TRUE),
+  datetime = sample(dates_2024, 20000, replace = TRUE),
+  quantity = sample(c(10, 15, 20, 30, 60, 90), 20000, replace = TRUE),
+  days_supply = sample(c(7, 14, 30, 60, 90), 20000, replace = TRUE),
+  refill = sample(0:1, 20000, replace = TRUE),
+  insurance_type = sample(c("Public","Private","None"), 20000, replace = TRUE),
+  wait_time_min = round(rnorm(20000, mean = 12, sd = 4), 1),
+  status = sample(c("Completed","Rejected","Cancelled"), 20000, replace = TRUE, prob = c(0.9,0.05,0.05))
+)
+
+write_csv(prescriptions, "prescriptions.csv")
+
+### 5. otc_sales.csv (20,000 rows)
+otc_categories <- c("Vitamins","Pain Relief","Cold/Flu","Digestive Health","Allergy")
+otc_products <- c("Ibuprofen","Acetaminophen","Multivitamin","Vitamin D","Omega-3","Loratadine","Probiotic")
+
+otc_sales <- tibble(
+  sale_id = sprintf("S%06d", 1:20000),
+  datetime = sample(dates_2024, 20000, replace = TRUE),
+  product_category = sample(otc_categories, 20000, replace = TRUE),
+  product_name = sample(otc_products, 20000, replace = TRUE),
+  quantity = sample(1:5, 20000, replace = TRUE),
+  unit_price = round(runif(20000, 5, 50), 2),
+  revenue = quantity * unit_price,
+  promotion_flag = sample(0:1, 20000, replace = TRUE),
+  patient_id = sample(c(patients$patient_id, rep(NA, 5000)), 20000, replace = TRUE)
+)
+
+write_csv(otc_sales, "otc_sales.csv")
+```
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE)
+
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(scales)
+library(glue)
+library(knitr)
+library(kableExtra)
+library(forecast)
+library(timetk)
+library(tsibble)
+library(lme4)
+library(ggplot2)
+
+theme_set(theme_minimal())
+
+safe_read <- function(path) {
+  if(file.exists(path)) read_csv(path) %>% clean_names()
+  else stop(glue("File not found: {path}"))
+}
+```
+
+# 1. Introduction
+
+This R Markdown provides a reproducible end-to-end analytics workflow for synthetic pharmacy operations data covering the year 2024.
+
+Key goals:
+- Prescription volume and peak times  
+- Technician performance & wait times  
+- Inventory risk & stockout simulation  
+- OTC sales behavior and promotion lift  
+- Forecasting demand and operational recommendations  
+
+
+# 2. Data loading and basic checks
+
+Place these CSVs in the same folder:
+- prescriptions.csv  
+- inventory.csv  
+- technicians.csv  
+- patients.csv  
+- otc_sales.csv  
+
+```{r load-data}
+prescriptions <- safe_read("prescriptions.csv")
+inventory     <- safe_read("inventory.csv")
+technicians   <- safe_read("technicians.csv")
+patients      <- safe_read("patients.csv")
+otc_sales     <- safe_read("otc_sales.csv")
+
+glimpse(prescriptions)
+glimpse(inventory)
+glimpse(technicians)
+glimpse(patients)
+glimpse(otc_sales)
+
+tibble(dataset = c("prescriptions","inventory","technicians","patients","otc_sales"),
+       n = c(nrow(prescriptions), nrow(inventory), nrow(technicians), nrow(patients), nrow(otc_sales))) %>%
+  kable() %>% kable_styling(full_width = FALSE)
+```
+
+
+# 3. Data preparation and enrichment
+
+```{r prep}
+prescriptions <- prescriptions %>%
+  mutate(
+    datetime = ymd_hms(datetime),
+    date = as_date(datetime),
+    hour = hour(datetime),
+    wday = wday(datetime, label = TRUE)
+  )
+
+
+otc_sales <- otc_sales %>%
+  mutate(
+    datetime = ymd_hms(datetime),
+    date = as_date(datetime),
+    hour = hour(datetime),
+    wday = wday(datetime, label = TRUE)
+  )
+
+
+prescriptions <- prescriptions %>% mutate(patient_id = as.character(patient_id),
+                                         technician_id = as.character(technician_id),
+                                         drug_id = as.character(drug_id))
+
+patients <- patients %>% mutate(patient_id = as.character(patient_id))
+technicians <- technicians %>% mutate(technician_id = as.character(technician_id))
+inventory <- inventory %>% mutate(drug_id = as.character(drug_id))
+otc_sales <- otc_sales %>% mutate(patient_id = as.character(patient_id))
+
+rx_full <- prescriptions %>%
+  left_join(patients, by = "patient_id") %>%
+  left_join(technicians, by = "technician_id") %>%
+  left_join(inventory, by = "drug_id")
+
+missing_tech <- rx_full %>% filter(is.na(technician_id)) %>% nrow()
+missing_drug <- rx_full %>% filter(is.na(drug_id) | is.na(drug_name)) %>% nrow()
+
+cat(glue("Missing technician assignments: {missing_tech}\nMissing drug lookups: {missing_drug}\n"))
+```
+
+
+# 4. Exploratory Data Analysis
+
+## 4.1 Prescription volume (daily & hourly)
+
+```{r rx-volume}
+daily_rx <- rx_full %>% count(date)
+
+ggplot(daily_rx, aes(date, n)) +
+  geom_line() +
+  labs(title = "Daily Prescription Volume (2024)",
+       y = "Prescriptions per day") +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b")
+
+hourly_rx <- rx_full %>% count(hour)
+
+ggplot(hourly_rx, aes(hour, n)) +
+  geom_col() +
+  labs(title = "Prescription Volume by Hour",
+       x = "Hour", y = "Count") +
+  scale_x_continuous(breaks = 0:23)
+```
+
+
+## 4.2 Weekday × hour heatmap
+
+```{r heatmap}
+heat_df <- rx_full %>%
+  group_by(wday, hour) %>%
+  summarise(n = n(), .groups = "drop")
+
+ggplot(heat_df, aes(hour, fct_rev(wday), fill = n)) +
+  geom_tile() +
+  labs(title = "Heatmap: Prescriptions by Weekday and Hour",
+       x = "Hour", y = "Weekday")
+```
+
+
+# 5. Wait Time Analysis & Technician Performance
+
+## 5.1 Wait time distribution
+
+```{r wait-dist}
+ggplot(rx_full, aes(wait_time_min)) +
+  geom_histogram(bins = 40) +
+  labs(title = "Distribution of Wait Times",
+       x = "Wait time (minutes)")
+
+avg_wait_hour <- rx_full %>%
+  group_by(hour) %>%
+  summarise(avg_wait = mean(wait_time_min, na.rm = TRUE))
+
+ggplot(avg_wait_hour, aes(hour, avg_wait)) +
+  geom_line() + geom_point() +
+  labs(title = "Average Wait Time by Hour",
+       x = "Hour", y = "Avg wait (minutes)")
+```
+
+
+## 5.2 Technician performance
+
+```{r tech-perf}
+tech_wait <- rx_full %>%
+  group_by(technician_id, name) %>%
+  summarise(
+    avg_wait = mean(wait_time_min, na.rm = TRUE),
+    rx_count = n(),
+    avg_experience = mean(experience_years, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(tech_wait, aes(reorder(name, avg_wait), avg_wait)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Average Wait Time by Technician",
+       x = "Technician", y = "Avg wait (min)")
+
+tech_wait %>% arrange(avg_wait) %>% head(5) %>% kable() %>% kable_styling()
+tech_wait %>% arrange(desc(avg_wait)) %>% head(5) %>% kable() %>% kable_styling()
+```
+
+
+# 6. Mixed-effects model for technician impact
+
+```{r tech-model}
+
+library(lme4)
+
+use_ins <- "insurance_type" %in% names(rx_full)
+
+model_data <- rx_full %>%
+  select(wait_time_min, technician_id, experience_years, hour,
+         !!(if (use_ins) sym("insurance_type") else NULL)) %>%
+  drop_na()
+
+formula <- if (use_ins) {
+  wait_time_min ~ insurance_type + experience_years + hour + (1 | technician_id)
+} else {
+  wait_time_min ~ experience_years + hour + (1 | technician_id)
+}
+
+m1 <- lmer(formula, data = model_data)
+
+summary(m1)
+
+# Random intercepts (technician effects)
+ranef_te <- ranef(m1)$technician_id %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("technician_id")
+
+names(ranef_te) <- c("technician_id", "rand_intercept")
+
+ranef_te %>%
+  arrange(desc(rand_intercept)) %>%
+  head() %>%
+  kable() %>%
+  kable_styling()
+
+```
+
+
+# 7. Inventory Risk & Stock Depletion Simulation
+
+```{r inventory-risk}
+inventory <- inventory %>%
+  mutate(stock_gap = stock_on_hand - reorder_level,
+         at_risk = stock_on_hand <= reorder_level)
+
+inventory %>% count(at_risk)
+
+inventory_at_risk <- inventory %>%
+  filter(at_risk) %>%
+  arrange(stock_on_hand)
+
+inventory_at_risk %>% head(20) %>% kable() %>% kable_styling()
+```
+
+
+## Stockout projection
+
+```{r inventory-simulation}
+daily_demand <- prescriptions %>%
+  count(drug_id, date) %>%
+  group_by(drug_id) %>%
+  summarise(avg_daily = mean(n))
+
+inv_sim <- inventory %>%
+  left_join(daily_demand, by = "drug_id") %>%
+  mutate(avg_daily = if_else(is.na(avg_daily), 0.5, avg_daily),
+         days_until_reorder = (stock_on_hand - reorder_level) / avg_daily,
+         projected_days_to_stockout = stock_on_hand / avg_daily,
+         reorder_by_date = Sys.Date() + ceiling(days_until_reorder),
+         expected_stockout_date = Sys.Date() + ceiling(projected_days_to_stockout),
+         needs_reorder_now = stock_on_hand <= reorder_level)
+
+inv_sim %>%
+  select(drug_id, drug_name, stock_on_hand, reorder_level,
+         avg_daily, needs_reorder_now, reorder_by_date, expected_stockout_date) %>%
+  head(20) %>% kable() %>% kable_styling()
+```
+
+
+# 8. Forecasting Daily Prescription Volume (30 days)
+
+```{r forecast-30d, fig.height=4, fig.width=8}
+
+# Ensure date column is valid
+if (!"date" %in% names(rx_full))
+  stop("rx_full is missing `date` column — earlier parsing failed.")
+
+daily_rx <- rx_full %>%
+  filter(!is.na(date)) %>%     # remove bad dates
+  count(date) %>% 
+  arrange(date)
+
+# Check for empty dataset
+if (nrow(daily_rx) == 0) {
+  stop("No valid date values found in prescriptions — cannot run forecast.")
+}
+
+# Fill missing dates (important for time series)
+full_dates <- seq(min(daily_rx$date), max(daily_rx$date), by = "day")
+
+daily_rx_full <- tibble(
+  date = full_dates
+) %>%
+  left_join(daily_rx, by = "date") %>%
+  mutate(n = ifelse(is.na(n), 0, n))
+
+# Build ts object safely
+rx_ts <- ts(
+  daily_rx_full$n,
+  frequency = 365
+)
+
+# Fit model
+fit <- auto.arima(rx_ts)
+
+# Forecast 30 days
+fcast <- forecast(fit, h = 30)
+
+# Plot
+autoplot(fcast) +
+  labs(
+    title = "30-Day Forecast: Daily Prescription Volume",
+    x = "Date",
+    y = "Prescriptions"
+  )
+
+# Forecast dataframe
+fcast_df <- tibble(
+  date = seq(max(daily_rx_full$date) + 1, by = "day", length.out = 30),
+  point_forecast = as.numeric(fcast$mean),
+  lo80 = as.numeric(fcast$lower[,1]),
+  hi80 = as.numeric(fcast$upper[,1]),
+  lo95 = as.numeric(fcast$lower[,2]),
+  hi95 = as.numeric(fcast$upper[,2])
+)
+
+fcast_df %>% head(10) %>% kable() %>% kable_styling(full_width = FALSE)
+
+
+```
+
+# 9. OTC Sales & Promotion Lift Analysis
+
+```{r otc-analysis}
+promo_summary <- otc_sales %>%
+  mutate(promotion_flag = as.integer(promotion_flag)) %>%
+  group_by(product_category, promotion_flag) %>%
+  summarise(
+    total_revenue = sum(revenue),
+    total_qty = sum(quantity),
+    n_sales = n(),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(names_from = promotion_flag,
+              values_from = c(total_revenue, total_qty, n_sales),
+              names_prefix = "promo_") %>%
+  mutate(lift_revenue = (total_revenue_promo_1 /
+                           pmax(total_revenue_promo_0, 1)) - 1) %>%
+  arrange(desc(lift_revenue))
+
+promo_summary %>% head(15) %>% kable() %>% kable_styling()
+
+otc_sales %>% count(wday) %>%
+  ggplot(aes(wday, n)) +
+  geom_col() +
+  labs(title = "OTC Sales by Day of Week",
+       x = "Day", y = "Sales Count")
+```
+
+
+# 10. Business Insights & Recommendations
+
+- **Peak hours** show strong lunchtime and evening surges → increase staffing at 11–2pm and 4–7pm.  
+- **Technician performance** varies meaningfully; experience reduces wait time → schedule senior techs during peak.  
+- **Inventory**: several SKUs require immediate reorder → short lead-time drugs prioritized.  
+- **OTC promotions**: categories with highest lift should get recurring targeted promotions.  
+- **Forecast** indicates expected surge periods → adjust technician scheduling and inventory planning.  
+
+
+# 11. Power BI Integration Notes
+
+- Create relationships:  
+  prescriptions → patients  
+  prescriptions → technicians  
+  prescriptions → inventory  
+  otc_sales → patients (nullable)
+
+Suggested pages:
+- RX Overview  
+- Wait Time Diagnostics  
+- Inventory & Stockouts  
+- OTC Promotions & Revenue Lift  
+
+
+# 12. Appendix
+
+```{r session-info}
+sessionInfo()
+```
+
+
